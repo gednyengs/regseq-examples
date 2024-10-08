@@ -1,0 +1,189 @@
+
+namespace org.simple {
+
+//! Key and Data Size
+const KD_SIZE: usize = 128;
+
+//! Error types for SimpleAES
+enum Error {
+    OK,         //! No error
+    KEY,        //! Key error
+    INPUT,      //! Input error
+    OUTPUT,     //! Output error
+    BUSY,       //! Device is busy with previous operation
+    OTHER       //! Other errors
+} // enum Error
+
+//! Operation Mode
+enum OpMode {
+    ENCRYPT,    //! Encryption mode
+    DECRYPT,    //! Decryption mode
+} // enum OpMode
+
+//! SimpleAES Commands
+enum SimpleAESCommand {
+    Encrypt(key: &[u8; KD_SIZE], i_data: &[u8; KD_SIZE], o_data: &mut [u8; KD_SIZE]),
+    Decrypt(key: &[u8; KD_SIZE], i_data: &[u8; KD_SIZE], o_data: &mut [u8; KD_SIZE]),
+}
+
+class SimpleAES() extends std.Device("org-simpleaes") with std.Command {
+
+    // Specify command type
+    type CommandType = SimpleAESCommand;
+
+    // Notification channel used between ISR and process contexts
+    private val notif = Notification<Error>("irq notifications")
+
+    // Interrupt
+    @handler("IrqHandler")
+    private val irq_line = Interrupt("simpleaes-irq");
+
+    // Register file
+    private val regfile = std.Mutex(Regfile<org.simple.SimpleRDL>("simpleaes-regmem"));
+
+    // Clock
+    private val axi_clock = Clock("simpleaes-clock");
+
+    @irq_handler
+    private fn IrqHandler(self: &mut Self) {
+
+        var reg_file = self.regfile.Acquire();
+        val irq_stat = reg_file.IRQ;
+
+        // Process interrupts
+        if (irq_stat[0] == 1) self.notif.Send(Error.OK);
+        else if(irq_stat[1] == 1) {
+            match self.Regfile.STAT.ERR {
+                case 1 => self.notif.Send(Error.KEY);
+                case 2 => self.notif.Send(Error.INPUT);
+                case 3 => self.notif.Send(Error.OUTPUT);
+            }
+        }
+
+        // Clear interrupts
+        reg_file.IRQ = irq_stat;
+    }
+
+    override fn command(self: &mut Self, cmd: &CommandType) -> std.Error {
+        return match cmd {
+            case Encrypt(key, i_data, o_data) => {
+                self.RunOp(OpMode.ENCRYPT, key, i_data, o_data)
+            }
+            case Decrypt(key, i_data, o_data) => {
+                self.RunOp(OpMode.DECRYPT, key, i_data, o_data)
+            }
+        }
+    }
+
+    //! Check if previous operation is still ongoing
+    private fn Busy(self: &Self) -> bool
+    {
+        return self.regfile.Acquire().STAT.BUSY == 1;
+    }
+
+    //! Set operation mode
+    private fn SetMode(self     : &mut Self,
+                       mode     : OpMode) -> Result<bool, Error>
+    {
+        // Fail if operation in progress
+        if (self.Busy()) { return Error.Busy; }
+
+        // Set control register
+        with self.regfile.Acquire() as r {
+            r.CTRL.OP = mode;
+            r.CTRL.IE = 1;
+        }
+
+        return true;
+    }
+
+    //! Set key address
+    private fn SetKeyAddr(self: &mut Self,
+                          addr: u32) -> Result<bool, Error>
+    {
+        with self.regfile.Acquire() as r {
+            r.KAR.ADDR = addr;
+        }
+        return true;
+    }
+
+    //! Set input data address
+    private fn SetInputAddr(self : &mut Self,
+                            addr : u32) -> Result<bool, Error>
+    {
+        self.regfile.Acquire().IAR.ADDR = addr;
+        return true;
+    }
+
+    //! Set output data address
+    private fn SetOutputAddr(self : &mut Self,
+                             addr : u32) -> Result<bool, Error>
+    {
+        self.regfile.Acquire().OAR.ADDR = addr;
+        return true;
+    }
+
+    //! Helper for running the AES engine
+    private fn RunOp(self   : &mut Self,
+                     mode   : OpMode,
+                     key    : &[u8],
+                     i_data : &[u8],
+                     o_data : &mut [u8]) -> Result<bool, Error>
+    {
+        // Allocate buffer for key
+        val key_buf = check_error(mem.HwAlloc[u8](KD_SIZE),
+                                  "failed to allocate buffer for key",
+                                  |e| => Error.KEY
+                                );
+
+        // Allocate buffer for input
+        val in_buffer = check_error(mem.HwAlloc[u8](KD_SIZE),
+                                    "failed to allocate buffer for input data",
+                                    |e| => Error.INPUT
+                                );
+
+        // Allocate buffer for output
+        val out_buffer = check_error(mem.HwAlloc[u8](KD_SIZE),
+                                     "failed to allocate buffer for output data",
+                                     |e| => Error.OUTPUT
+                                 );
+
+         // Set mode
+         check_error(SetMode(mode), "failed to set operation mode", |e| => e);
+
+        // Copy key
+        check_error(mem.Copy(key_buf, key, KD_SIZE), "failed to copy key",
+                    |e| => Error.KEY);
+
+        // Copy input data
+        check_error(mem.Copy(in_buffer, i_data, KD_SIZE), "failed to copy input data",
+                |e| => Error.INPUT);
+
+        // Set key address
+        check_error(SetKeyAddr(key_buf.GetPhysAddr() as u32),
+                    "failed to set key address",
+                    |e| => e);
+
+        // Set input data address
+        check_error(SetInputAddr(in_buffer.GetPhysAddr() as u32),
+                    "failed to set input data address",
+                    |e| => e);
+
+        // Set output address and start transaction
+        check_error(SetOutputAddr(out_buffer.GetPhysAddr() as u32),
+                    "failed to set output data address",
+                    |e| => e);
+
+        // Wait for completion
+        check_error(self.notif.Receive(), "Operation failed", |e| => Error.OTHER);
+
+        // Copy output
+        check_error("failed to copy output data",
+                    mem.Copy(o_data, out_buffer, KD_SIZE),
+                   |e| => Error.OUTPUT
+               );
+
+        return true;
+    }
+} // class SimpleAES
+} // namespace org.simple
